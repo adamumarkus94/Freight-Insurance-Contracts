@@ -256,3 +256,106 @@
     contract-balance: (var-get contract-balance)
   }
 )
+
+
+(define-constant err-no-dispute-exists (err u110))
+(define-constant err-dispute-exists (err u111))
+
+(define-map claim-disputes
+  { claim-id: uint }
+  {
+    carrier-response: (string-ascii 256),
+    block-filed: uint,
+    resolved: bool
+  }
+)
+
+(define-public (file-dispute (claim-id uint) (response (string-ascii 256)))
+  (let 
+    (
+      (claim (unwrap! (map-get? claims { claim-id: claim-id }) err-not-found))
+      (policy (unwrap! (map-get? policies { policy-id: (get policy-id claim) }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get carrier policy)) err-unauthorized)
+    (asserts! (is-eq (get status claim) "pending") err-claim-already-processed)
+    (asserts! (is-none (map-get? claim-disputes { claim-id: claim-id })) err-dispute-exists)
+    
+    (map-set claim-disputes
+      { claim-id: claim-id }
+      {
+        carrier-response: response,
+        block-filed: stacks-block-height,
+        resolved: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-dispute (claim-id uint))
+  (map-get? claim-disputes { claim-id: claim-id })
+)
+
+
+(define-public (resolve-dispute (claim-id uint))
+  (let 
+    (
+      (dispute (unwrap! (map-get? claim-disputes { claim-id: claim-id }) err-no-dispute-exists))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-eq (get resolved dispute) false) err-claim-already-processed)
+    
+    (map-set claim-disputes
+      { claim-id: claim-id }
+      (merge dispute { resolved: true })
+    )
+    
+    (ok true)
+  )
+)
+(define-public (get-dispute-status (claim-id uint))
+  (let 
+    (
+      (dispute (unwrap! (map-get? claim-disputes { claim-id: claim-id }) err-no-dispute-exists))
+    )
+    (ok (get resolved dispute))
+  )
+)
+(define-public (get-dispute-response (claim-id uint))
+  (let 
+    (
+      (dispute (unwrap! (map-get? claim-disputes { claim-id: claim-id }) err-no-dispute-exists))
+    )
+    (ok (get carrier-response dispute))
+  )
+)
+(define-public (get-dispute-filing-block (claim-id uint))
+  (let 
+    (
+      (dispute (unwrap! (map-get? claim-disputes { claim-id: claim-id }) err-no-dispute-exists))
+    )
+    (ok (get block-filed dispute))
+  )
+
+)
+
+(define-constant err-refund-not-available (err u112))
+(define-constant refund-rate  u50) ;; 50% refund rate
+
+(define-public (claim-premium-refund (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (policy-claimed (get claim-ids (get-policy-claims-list policy-id)))
+      (refund-amount (/ (* (get premium policy) refund-rate) u100))
+    )
+    (asserts! (is-eq tx-sender (get shipper policy)) err-unauthorized)
+    (asserts! (is-eq (get status policy) "delivered") err-policy-not-active)
+    (asserts! (is-eq (len policy-claimed) u0) err-refund-not-available)
+    (asserts! (<= refund-amount (var-get contract-balance)) err-insufficient-funds)
+    
+    (var-set contract-balance (- (var-get contract-balance) refund-amount))
+    
+    (as-contract (stx-transfer? refund-amount tx-sender (get shipper policy)))
+  )
+)
