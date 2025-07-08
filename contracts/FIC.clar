@@ -646,6 +646,71 @@
 (define-constant err-refund-not-available (err u112))
 (define-constant refund-rate  u50) ;; 50% refund rate
 
+(define-constant err-invalid-tier (err u117))
+(define-constant err-discount-code-not-found (err u118))
+(define-constant err-discount-code-expired (err u119))
+(define-constant err-discount-code-already-used (err u120))
+(define-constant err-discount-code-exists (err u121))
+(define-constant err-insufficient-loyalty-points (err u122))
+
+(define-map user-loyalty-profiles
+  { user: principal }
+  {
+    total-policies: uint,
+    successful-deliveries: uint,
+    claim-free-policies: uint,
+    total-value-insured: uint,
+    loyalty-points: uint,
+    tier-level: uint,
+    last-updated: uint
+  }
+)
+
+(define-map tier-benefits
+  { tier: uint }
+  {
+    discount-percentage: uint,
+    min-policies: uint,
+    min-value: uint,
+    bonus-points-multiplier: uint,
+    max-discount-codes: uint
+  }
+)
+
+(define-map discount-codes
+  { code: (string-ascii 20) }
+  {
+    creator: principal,
+    discount-percentage: uint,
+    expiry-block: uint,
+    max-uses: uint,
+    current-uses: uint,
+    min-value: uint,
+    active: bool
+  }
+)
+
+(define-map user-discount-usage
+  { user: principal, code: (string-ascii 20) }
+  { used: bool, used-block: uint }
+)
+
+(define-map policy-loyalty-tracking
+  { policy-id: uint }
+  {
+    user: principal,
+    loyalty-points-earned: uint,
+    tier-at-creation: uint,
+    discount-applied: uint
+  }
+)
+
+(define-data-var loyalty-points-per-policy uint u10)
+(define-data-var bonus-points-successful-delivery uint u25)
+(define-data-var bonus-points-claim-free uint u15)
+(define-data-var volume-bonus-threshold uint u100000)
+(define-data-var volume-bonus-points uint u50)
+
 (define-public (claim-premium-refund (policy-id uint))
   (let 
     (
@@ -661,6 +726,308 @@
     (var-set contract-balance (- (var-get contract-balance) refund-amount))
     
     (as-contract (stx-transfer? refund-amount tx-sender (get shipper policy)))
+  )
+)
+
+(define-public (initialize-tier-system)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set tier-benefits { tier: u0 } { discount-percentage: u0, min-policies: u0, min-value: u0, bonus-points-multiplier: u1, max-discount-codes: u0 })
+    (map-set tier-benefits { tier: u1 } { discount-percentage: u5, min-policies: u5, min-value: u50000, bonus-points-multiplier: u1, max-discount-codes: u1 })
+    (map-set tier-benefits { tier: u2 } { discount-percentage: u10, min-policies: u15, min-value: u150000, bonus-points-multiplier: u2, max-discount-codes: u2 })
+    (map-set tier-benefits { tier: u3 } { discount-percentage: u15, min-policies: u30, min-value: u300000, bonus-points-multiplier: u3, max-discount-codes: u3 })
+    (map-set tier-benefits { tier: u4 } { discount-percentage: u20, min-policies: u50, min-value: u500000, bonus-points-multiplier: u4, max-discount-codes: u5 })
+    (ok true)
+  )
+)
+
+(define-private (get-or-create-loyalty-profile (user principal))
+  (default-to
+    {
+      total-policies: u0,
+      successful-deliveries: u0,
+      claim-free-policies: u0,
+      total-value-insured: u0,
+      loyalty-points: u0,
+      tier-level: u0,
+      last-updated: stacks-block-height
+    }
+    (map-get? user-loyalty-profiles { user: user })
+  )
+)
+
+(define-private (calculate-tier-level (profile { total-policies: uint, successful-deliveries: uint, claim-free-policies: uint, total-value-insured: uint, loyalty-points: uint, tier-level: uint, last-updated: uint }))
+  (if (and (>= (get total-policies profile) u50) (>= (get total-value-insured profile) u500000))
+    u4
+    (if (and (>= (get total-policies profile) u30) (>= (get total-value-insured profile) u300000))
+      u3
+      (if (and (>= (get total-policies profile) u15) (>= (get total-value-insured profile) u150000))
+        u2
+        (if (and (>= (get total-policies profile) u5) (>= (get total-value-insured profile) u50000))
+          u1
+          u0
+        )
+      )
+    )
+  )
+)
+
+(define-private (get-tier-discount (tier uint))
+  (default-to u0 (get discount-percentage (map-get? tier-benefits { tier: tier })))
+)
+
+(define-private (calculate-loyalty-points (value uint) (tier uint))
+  (let (
+    (base-points (var-get loyalty-points-per-policy))
+    (multiplier (default-to u1 (get bonus-points-multiplier (map-get? tier-benefits { tier: tier }))))
+    (volume-bonus (if (>= value (var-get volume-bonus-threshold)) (var-get volume-bonus-points) u0))
+  )
+    (+ (* base-points multiplier) volume-bonus)
+  )
+)
+
+(define-public (create-policy-with-loyalty (carrier principal) (receiver principal) (value uint) (duration uint) (discount-code (optional (string-ascii 20))))
+  (let 
+    (
+      (policy-id (increment-policy-count))
+      (user-profile (get-or-create-loyalty-profile tx-sender))
+      (tier-level (calculate-tier-level user-profile))
+      (tier-discount (get-tier-discount tier-level))
+      (code-discount (if (is-some discount-code) (get-discount-from-code (unwrap-panic discount-code) value) u0))
+      (total-discount (+ tier-discount code-discount))
+      (premium-amount (/ (* value (var-get premium-rate)) u100))
+      (discounted-premium (- premium-amount (/ (* premium-amount total-discount) u100)))
+      (start-block stacks-block-height)
+      (end-block (+ stacks-block-height duration))
+      (loyalty-points-earned (calculate-loyalty-points value tier-level))
+    )
+    (asserts! (> value u0) err-invalid-amount)
+    (asserts! (> duration u0) err-invalid-amount)
+    (asserts! (is-ok (stx-transfer? discounted-premium tx-sender (as-contract tx-sender))) err-insufficient-funds)
+    
+    (if (is-some discount-code) 
+        (try! (use-discount-code (unwrap-panic discount-code))) 
+        true)
+    
+    (map-set policies 
+      { policy-id: policy-id }
+      {
+        shipper: tx-sender,
+        carrier: carrier,
+        receiver: receiver,
+        value: value,
+        premium: discounted-premium,
+        start-block: start-block,
+        end-block: end-block,
+        status: "active"
+      }
+    )
+    
+    (map-set policy-claims { policy-id: policy-id } { claim-ids: (list) })
+    
+    (let (
+      (updated-profile (merge user-profile {
+        total-policies: (+ (get total-policies user-profile) u1),
+        total-value-insured: (+ (get total-value-insured user-profile) value),
+        loyalty-points: (+ (get loyalty-points user-profile) loyalty-points-earned),
+        tier-level: tier-level,
+        last-updated: stacks-block-height
+      }))
+    )
+      (map-set user-loyalty-profiles { user: tx-sender } updated-profile)
+    )
+    
+    (map-set policy-loyalty-tracking
+      { policy-id: policy-id }
+      {
+        user: tx-sender,
+        loyalty-points-earned: loyalty-points-earned,
+        tier-at-creation: tier-level,
+        discount-applied: total-discount
+      }
+    )
+    
+    (var-set total-premiums (+ (var-get total-premiums) discounted-premium))
+    (var-set contract-balance (+ (var-get contract-balance) discounted-premium))
+    
+    (ok policy-id)
+  )
+)
+
+(define-private (get-discount-from-code (code (string-ascii 20)) (value uint))
+  (let ((discount-info (map-get? discount-codes { code: code })))
+    (if (is-some discount-info)
+      (let ((info (unwrap-panic discount-info)))
+        (if (and (get active info) 
+                 (> (get expiry-block info) stacks-block-height)
+                 (< (get current-uses info) (get max-uses info))
+                 (>= value (get min-value info))
+                 (is-none (map-get? user-discount-usage { user: tx-sender, code: code })))
+          (get discount-percentage info)
+          u0
+        )
+      )
+      u0
+    )
+  )
+)
+
+(define-private (use-discount-code (code (string-ascii 20)))
+  (let ((discount-info (unwrap! (map-get? discount-codes { code: code }) err-discount-code-not-found)))
+    (asserts! (get active discount-info) err-discount-code-not-found)
+    (asserts! (> (get expiry-block discount-info) stacks-block-height) err-discount-code-expired)
+    (asserts! (< (get current-uses discount-info) (get max-uses discount-info)) err-discount-code-already-used)
+    (asserts! (is-none (map-get? user-discount-usage { user: tx-sender, code: code })) err-discount-code-already-used)
+    
+    (map-set discount-codes
+      { code: code }
+      (merge discount-info { current-uses: (+ (get current-uses discount-info) u1) })
+    )
+    
+    (map-set user-discount-usage
+      { user: tx-sender, code: code }
+      { used: true, used-block: stacks-block-height }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-policy-loyalty-on-delivery (policy-id uint))
+  (let 
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+      (tracking (unwrap! (map-get? policy-loyalty-tracking { policy-id: policy-id }) err-not-found))
+      (user (get user tracking))
+      (user-profile (get-or-create-loyalty-profile user))
+      (policy-claims-list (get claim-ids (get-policy-claims-list policy-id)))
+      (is-claim-free (is-eq (len policy-claims-list) u0))
+      (delivery-points (var-get bonus-points-successful-delivery))
+      (claim-free-points (if is-claim-free (var-get bonus-points-claim-free) u0))
+      (total-bonus-points (+ delivery-points claim-free-points))
+    )
+    (asserts! (is-eq tx-sender (get receiver policy)) err-unauthorized)
+    (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+    
+    (let (
+      (updated-profile (merge user-profile {
+        successful-deliveries: (+ (get successful-deliveries user-profile) u1),
+        claim-free-policies: (+ (get claim-free-policies user-profile) (if is-claim-free u1 u0)),
+        loyalty-points: (+ (get loyalty-points user-profile) total-bonus-points),
+        tier-level: (calculate-tier-level user-profile),
+        last-updated: stacks-block-height
+      }))
+    )
+      (map-set user-loyalty-profiles { user: user } updated-profile)
+    )
+    
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { status: "delivered" })
+    )
+    
+    (ok total-bonus-points)
+  )
+)
+
+(define-public (create-discount-code (code (string-ascii 20)) (discount-percentage uint) (expiry-blocks uint) (max-uses uint) (min-value uint))
+  (let 
+    (
+      (user-profile (get-or-create-loyalty-profile tx-sender))
+      (tier-level (get tier-level user-profile))
+      (tier-info (unwrap! (map-get? tier-benefits { tier: tier-level }) err-invalid-tier))
+      (max-allowed-codes (get max-discount-codes tier-info))
+      (expiry-block (+ stacks-block-height expiry-blocks))
+    )
+    (asserts! (> max-allowed-codes u0) err-insufficient-loyalty-points)
+    (asserts! (is-none (map-get? discount-codes { code: code })) err-discount-code-exists)
+    (asserts! (> discount-percentage u0) err-invalid-amount)
+    (asserts! (<= discount-percentage u25) err-invalid-amount)
+    (asserts! (> max-uses u0) err-invalid-amount)
+    (asserts! (> expiry-blocks u0) err-invalid-amount)
+    
+    (map-set discount-codes
+      { code: code }
+      {
+        creator: tx-sender,
+        discount-percentage: discount-percentage,
+        expiry-block: expiry-block,
+        max-uses: max-uses,
+        current-uses: u0,
+        min-value: min-value,
+        active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-discount-code (code (string-ascii 20)))
+  (let ((discount-info (unwrap! (map-get? discount-codes { code: code }) err-discount-code-not-found)))
+    (asserts! (is-eq tx-sender (get creator discount-info)) err-unauthorized)
+    
+    (map-set discount-codes
+      { code: code }
+      (merge discount-info { active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (spend-loyalty-points (points uint))
+  (let ((user-profile (get-or-create-loyalty-profile tx-sender)))
+    (asserts! (>= (get loyalty-points user-profile) points) err-insufficient-loyalty-points)
+    
+    (map-set user-loyalty-profiles
+      { user: tx-sender }
+      (merge user-profile { loyalty-points: (- (get loyalty-points user-profile) points) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-loyalty-profile (user principal))
+  (get-or-create-loyalty-profile user)
+)
+
+(define-read-only (get-tier-benefits-info (tier uint))
+  (map-get? tier-benefits { tier: tier })
+)
+
+(define-read-only (get-discount-code-info (code (string-ascii 20)))
+  (map-get? discount-codes { code: code })
+)
+
+(define-read-only (get-policy-loyalty-info (policy-id uint))
+  (map-get? policy-loyalty-tracking { policy-id: policy-id })
+)
+
+(define-read-only (get-user-discount-usage-info (user principal) (code (string-ascii 20)))
+  (map-get? user-discount-usage { user: user, code: code })
+)
+
+(define-read-only (calculate-potential-discount (user principal) (value uint) (discount-code (optional (string-ascii 20))))
+  (let 
+    (
+      (user-profile (get-or-create-loyalty-profile user))
+      (tier-level (calculate-tier-level user-profile))
+      (tier-discount (get-tier-discount tier-level))
+      (code-discount (if (is-some discount-code) (get-discount-from-code (unwrap-panic discount-code) value) u0))
+      (total-discount (+ tier-discount code-discount))
+      (premium-amount (/ (* value (var-get premium-rate)) u100))
+      (discount-amount (/ (* premium-amount total-discount) u100))
+    )
+    {
+      tier-discount: tier-discount,
+      code-discount: code-discount,
+      total-discount: total-discount,
+      original-premium: premium-amount,
+      discount-amount: discount-amount,
+      final-premium: (- premium-amount discount-amount)
+    }
   )
 )
 
