@@ -1031,5 +1031,374 @@
   )
 )
 
+;; Route Risk Assessment & Dynamic Pricing System
+(define-constant err-route-not-found (err u123))
+(define-constant err-invalid-risk-factor (err u124))
+(define-constant err-route-already-exists (err u125))
+(define-constant err-invalid-coordinates (err u126))
+(define-constant err-risk-factor-not-found (err u127))
+
+;; Route definitions with geographic and risk data
+(define-map shipping-routes
+  { route-id: (string-ascii 20) }
+  {
+    origin-country: (string-ascii 30),
+    destination-country: (string-ascii 30),
+    origin-port: (string-ascii 50),
+    destination-port: (string-ascii 50),
+    distance-km: uint,
+    base-risk-score: uint, ;; 1-100 scale
+    seasonal-multiplier: uint, ;; percentage adjustment
+    active: bool,
+    created-block: uint
+  }
+)
+
+;; Dynamic risk factors that affect route pricing
+(define-map route-risk-factors
+  { route-id: (string-ascii 20), factor-type: (string-ascii 20) }
+  {
+    risk-multiplier: uint, ;; percentage impact on base premium
+    severity-level: uint, ;; 1-5 scale
+    expiry-block: uint,
+    last-updated: uint,
+    active: bool
+  }
+)
+
+;; Historical route performance tracking
+(define-map route-performance
+  { route-id: (string-ascii 20) }
+  {
+    total-policies: uint,
+    successful-deliveries: uint,
+    total-claims: uint,
+    total-claims-value: uint,
+    average-transit-time: uint,
+    last-incident-block: uint,
+    performance-score: uint ;; calculated metric 1-100
+  }
+)
+
+;; Route-specific policy tracking
+(define-map route-policies
+  { policy-id: uint }
+  {
+    route-id: (string-ascii 20),
+    route-risk-premium: uint,
+    risk-factors-applied: (list 5 (string-ascii 20)),
+    calculated-risk-score: uint
+  }
+)
+
+;; Risk factor definitions
+(define-map risk-factor-definitions
+  { factor-type: (string-ascii 20) }
+  {
+    description: (string-ascii 100),
+    max-multiplier: uint,
+    category: (string-ascii 30),
+    base-duration: uint
+  }
+)
+
+;; Administrative settings for route system
+(define-data-var route-system-enabled bool false)
+(define-data-var max-route-risk-multiplier uint u200) ;; 200% max increase
+(define-data-var base-route-assessment-fee uint u1000) ;; STX fee for route analysis
+
+(define-public (initialize-route-system)
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    
+    ;; Initialize common risk factor definitions
+    (map-set risk-factor-definitions { factor-type: "weather" } 
+      { description: "Severe weather conditions affecting transport", max-multiplier: u50, category: "environmental", base-duration: u1440 })
+    (map-set risk-factor-definitions { factor-type: "political" } 
+      { description: "Political instability or trade restrictions", max-multiplier: u75, category: "geopolitical", base-duration: u4320 })
+    (map-set risk-factor-definitions { factor-type: "piracy" } 
+      { description: "Maritime piracy or theft risk", max-multiplier: u100, category: "security", base-duration: u2160 })
+    (map-set risk-factor-definitions { factor-type: "congestion" } 
+      { description: "Port or transport congestion delays", max-multiplier: u25, category: "logistics", base-duration: u720 })
+    (map-set risk-factor-definitions { factor-type: "infrastructure" } 
+      { description: "Infrastructure damage or limitations", max-multiplier: u60, category: "physical", base-duration: u2880 })
+    
+    (var-set route-system-enabled true)
+    (ok true)
+  )
+)
+
+(define-public (register-shipping-route (route-id (string-ascii 20)) (origin-country (string-ascii 30)) (destination-country (string-ascii 30)) 
+                                        (origin-port (string-ascii 50)) (destination-port (string-ascii 50)) 
+                                        (distance-km uint) (base-risk-score uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (var-get route-system-enabled) err-policy-not-active)
+    (asserts! (is-none (map-get? shipping-routes { route-id: route-id })) err-route-already-exists)
+    (asserts! (and (> base-risk-score u0) (<= base-risk-score u100)) err-invalid-risk-factor)
+    (asserts! (> distance-km u0) err-invalid-coordinates)
+    
+    (map-set shipping-routes
+      { route-id: route-id }
+      {
+        origin-country: origin-country,
+        destination-country: destination-country,
+        origin-port: origin-port,
+        destination-port: destination-port,
+        distance-km: distance-km,
+        base-risk-score: base-risk-score,
+        seasonal-multiplier: u100, ;; neutral starting point
+        active: true,
+        created-block: stacks-block-height
+      }
+    )
+    
+    ;; Initialize performance tracking
+    (map-set route-performance
+      { route-id: route-id }
+      {
+        total-policies: u0,
+        successful-deliveries: u0,
+        total-claims: u0,
+        total-claims-value: u0,
+        average-transit-time: u0,
+        last-incident-block: u0,
+        performance-score: u75 ;; neutral starting score
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-route-risk-factor (route-id (string-ascii 20)) (factor-type (string-ascii 20)) 
+                                         (risk-multiplier uint) (severity-level uint) (duration-blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (is-some (map-get? shipping-routes { route-id: route-id })) err-route-not-found)
+    (asserts! (is-some (map-get? risk-factor-definitions { factor-type: factor-type })) err-risk-factor-not-found)
+    (asserts! (and (> severity-level u0) (<= severity-level u5)) err-invalid-risk-factor)
+    (asserts! (<= risk-multiplier (var-get max-route-risk-multiplier)) err-invalid-risk-factor)
+    (asserts! (> duration-blocks u0) err-invalid-amount)
+    
+    (map-set route-risk-factors
+      { route-id: route-id, factor-type: factor-type }
+      {
+        risk-multiplier: risk-multiplier,
+        severity-level: severity-level,
+        expiry-block: (+ stacks-block-height duration-blocks),
+        last-updated: stacks-block-height,
+        active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (calculate-route-risk-premium (route-id (string-ascii 20)) (base-premium uint))
+  (match (map-get? shipping-routes { route-id: route-id })
+    route-info
+    (let (
+      (base-risk (get base-risk-score route-info))
+      (seasonal-adj (get seasonal-multiplier route-info))
+      (performance-data (default-to 
+        { total-policies: u0, successful-deliveries: u0, total-claims: u0, total-claims-value: u0, 
+          average-transit-time: u0, last-incident-block: u0, performance-score: u75 }
+        (map-get? route-performance { route-id: route-id })))
+    )
+      ;; Calculate base adjustment from route risk score
+      (let (
+        (base-adjustment (/ (* base-premium base-risk) u100))
+        (seasonal-adjustment (/ (* base-adjustment seasonal-adj) u100))
+        (performance-adjustment (/ (* seasonal-adjustment (get performance-score performance-data)) u100))
+      )
+        ;; Apply active risk factors
+        (fold apply-risk-factor-to-premium 
+          (list "weather" "political" "piracy" "congestion" "infrastructure")
+          { route-id: route-id, premium: performance-adjustment }
+        )
+      )
+    )
+    { route-id: route-id, premium: base-premium }
+  )
+)
+
+(define-private (apply-risk-factor-to-premium (factor-type (string-ascii 20)) 
+                                             (state { route-id: (string-ascii 20), premium: uint }))
+  (let (
+    (risk-factor (map-get? route-risk-factors { route-id: (get route-id state), factor-type: factor-type }))
+    (current-premium (get premium state))
+  )
+    (if (and (is-some risk-factor) 
+             (get active (unwrap-panic risk-factor))
+             (> (get expiry-block (unwrap-panic risk-factor)) stacks-block-height))
+      ;; Apply risk factor multiplier
+      (let ((multiplier (get risk-multiplier (unwrap-panic risk-factor))))
+        { route-id: (get route-id state), 
+          premium: (+ current-premium (/ (* current-premium multiplier) u100)) }
+      )
+      ;; No change if factor not active or expired
+      state
+    )
+  )
+)
+
+(define-public (create-route-based-policy (carrier principal) (receiver principal) (value uint) 
+                                          (duration uint) (route-id (string-ascii 20)))
+  (let (
+    (policy-id (increment-policy-count))
+    (route-info (unwrap! (map-get? shipping-routes { route-id: route-id }) err-route-not-found))
+    (base-premium (/ (* value (var-get premium-rate)) u100))
+    (route-premium-calc (calculate-route-risk-premium route-id base-premium))
+    (final-premium (get premium route-premium-calc))
+    (assessment-fee (var-get base-route-assessment-fee))
+    (total-cost (+ final-premium assessment-fee))
+    (start-block stacks-block-height)
+    (end-block (+ stacks-block-height duration))
+    (active-factors (list))
+  )
+    (asserts! (get active route-info) err-route-not-found)
+    (asserts! (> value u0) err-invalid-amount)
+    (asserts! (> duration u0) err-invalid-amount)
+    (asserts! (is-ok (stx-transfer? total-cost tx-sender (as-contract tx-sender))) err-insufficient-funds)
+    
+    ;; Create the policy
+    (map-set policies 
+      { policy-id: policy-id }
+      {
+        shipper: tx-sender,
+        carrier: carrier,
+        receiver: receiver,
+        value: value,
+        premium: final-premium,
+        start-block: start-block,
+        end-block: end-block,
+        status: "active"
+      }
+    )
+    
+    ;; Track route-specific information
+    (map-set route-policies
+      { policy-id: policy-id }
+      {
+        route-id: route-id,
+        route-risk-premium: (- final-premium base-premium),
+        risk-factors-applied: active-factors,
+        calculated-risk-score: (get base-risk-score route-info)
+      }
+    )
+    
+    (map-set policy-claims { policy-id: policy-id } { claim-ids: (list) })
+    
+    ;; Update route performance statistics
+    (update-route-statistics route-id u1 u0 u0)
+    
+    (var-set total-premiums (+ (var-get total-premiums) final-premium))
+    (var-set contract-balance (+ (var-get contract-balance) final-premium))
+    
+    (ok policy-id)
+  )
+)
+
+
+
+(define-private (update-route-statistics (route-id (string-ascii 20)) (policies-delta uint) 
+                                        (deliveries-delta uint) (claims-delta uint))
+  (let ((current-perf (default-to 
+          { total-policies: u0, successful-deliveries: u0, total-claims: u0, total-claims-value: u0,
+            average-transit-time: u0, last-incident-block: u0, performance-score: u75 }
+          (map-get? route-performance { route-id: route-id }))))
+    (map-set route-performance
+      { route-id: route-id }
+      (merge current-perf {
+        total-policies: (+ (get total-policies current-perf) policies-delta),
+        successful-deliveries: (+ (get successful-deliveries current-perf) deliveries-delta),
+        total-claims: (+ (get total-claims current-perf) claims-delta),
+        performance-score: (calculate-performance-score 
+          (+ (get total-policies current-perf) policies-delta)
+          (+ (get successful-deliveries current-perf) deliveries-delta)
+          (+ (get total-claims current-perf) claims-delta))
+      })
+    )
+  )
+)
+
+(define-private (calculate-performance-score (total-policies uint) (deliveries uint) (route-claims uint))
+  (if (is-eq total-policies u0)
+    u75 ;; Default score for new routes
+    (let (
+      (delivery-rate (if (> total-policies u0) (/ (* deliveries u100) total-policies) u0))
+      (claim-rate (if (> total-policies u0) (/ (* route-claims u100) total-policies) u0))
+    )
+      ;; Performance score based on delivery success and low claim rates
+      (if (< (- u100 (/ claim-rate u2)) u1) u1 
+        (if (> (- u100 (/ claim-rate u2)) u100) u100 (- u100 (/ claim-rate u2))))
+    )
+  )
+)
+
+(define-public (update-route-delivery (policy-id uint))
+  (let (
+    (policy (unwrap! (map-get? policies { policy-id: policy-id }) err-not-found))
+    (route-policy (unwrap! (map-get? route-policies { policy-id: policy-id }) err-not-found))
+    (route-id (get route-id route-policy))
+  )
+    (asserts! (is-eq tx-sender (get receiver policy)) err-unauthorized)
+    (asserts! (is-eq (get status policy) "active") err-policy-not-active)
+    
+    ;; Update policy status
+    (map-set policies
+      { policy-id: policy-id }
+      (merge policy { status: "delivered" })
+    )
+    
+    ;; Update route statistics
+    (update-route-statistics route-id u0 u1 u0)
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for route information
+(define-read-only (get-route-info (route-id (string-ascii 20)))
+  (map-get? shipping-routes { route-id: route-id })
+)
+
+(define-read-only (get-route-performance (route-id (string-ascii 20)))
+  (map-get? route-performance { route-id: route-id })
+)
+
+(define-read-only (get-route-risk-factors (route-id (string-ascii 20)))
+  {
+    weather: (map-get? route-risk-factors { route-id: route-id, factor-type: "weather" }),
+    political: (map-get? route-risk-factors { route-id: route-id, factor-type: "political" }),
+    piracy: (map-get? route-risk-factors { route-id: route-id, factor-type: "piracy" }),
+    congestion: (map-get? route-risk-factors { route-id: route-id, factor-type: "congestion" }),
+    infrastructure: (map-get? route-risk-factors { route-id: route-id, factor-type: "infrastructure" })
+  }
+)
+
+(define-read-only (get-policy-route-info (policy-id uint))
+  (map-get? route-policies { policy-id: policy-id })
+)
+
+(define-read-only (calculate-route-premium-preview (route-id (string-ascii 20)) (value uint))
+  (let (
+    (base-premium (/ (* value (var-get premium-rate)) u100))
+    (route-premium-calc (calculate-route-risk-premium route-id base-premium))
+    (final-premium (get premium route-premium-calc))
+    (assessment-fee (var-get base-route-assessment-fee))
+  )
+    {
+      base-premium: base-premium,
+      route-risk-adjustment: (- final-premium base-premium),
+      final-premium: final-premium,
+      assessment-fee: assessment-fee,
+      total-cost: (+ final-premium assessment-fee)
+    }
+  )
+)
+
 
 
